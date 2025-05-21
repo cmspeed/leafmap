@@ -6048,28 +6048,49 @@ def mosaic(
     if verbose:
         print(f"Saved mosaic to {output}")
 
-
-def mosaic_opera(DS, merge_args={}):
+def mosaic_opera(DS, product="OPERA_L3_DSWX-S1_V1", merge_args={}):
     """Mosaics a list of OPERA product granules into a single image (in memory).
-
+    
     Args:
         DS (list): A list of OPERA product granules opened as xarray.DataArray objects.
+        product (str): OPERA product short name. Used to define pixel prioritization scheme in regions of OPERA granule overlap.
+            Options include: "OPERA_L3_DSWX-HLS_V1","OPERA_L3_DSWX-S1_V1", "OPERA_L3_DIST-ALERT-HLS_V1", "OPERA_L3_DIST-ANN-HLS_V1", "OPERA_L2_RTC-S1_V1" 
+            Default: "OPERA_L3_DSWX-S1_V1"
         merge_args (dict, optional): A dictionary of arguments to pass to the rioxarray.merge_arrays function. Defaults to {}.
-
+    
     Returns:
         da_mosaic: An xarray.DataArray containing the mosaic of the individual OPERA product granule DataArrays.
         colormap: A colormap for the mosaic, if in the original OPERA metadata, otherwise None.
         nodata: The nodata value for the mosaic corresponding to the original OPERA product granule metadata.
     """
     from rioxarray.merge import merge_arrays
-
+    import numpy as np
+    
     DA = []
     for ds in DS:
         nodata = ds.rio.nodata
         da = ds.fillna(nodata)
         DA.append(da)
 
-    merged_arr = merge_arrays(DA)
+    # Define 'valid' values for each product type
+    if product.startswith("OPERA_L3_DSWX"):
+        priority = {1: 100, 2:95, 3: 90, 0: 50, 250: 20, 251: 15, 252: 10, 253:5, 254:1, 255: 0}
+    elif product.startswith("OPERA_L3_DIST"):
+        priority = {1: 100, 2:100,3: 100, 4:100, 5:100, 6:100, 7:100, 8:100, 9:100, 10:100, 0:10, 255: 0}
+    # elif product.startswith("OPERA_L2_RTC"):
+    #     priority = {update the logic here to say prioritize anything greater than 0}
+    else:
+        priority = {}
+
+    valid_values = set(priority.keys())
+
+    # Check if any DataArray contains non-valid values, if so fall back to defaul rasterio.merge method
+    if contains_unexpected_values(DA, valid_values):
+        method = "first"
+    else:
+        method = opera_rules(product=product, nodata=nodata)
+
+    merged_arr = merge_arrays(DA, method=method)
 
     try:
         colormap = get_image_colormap(DS[0])
@@ -6077,6 +6098,112 @@ def mosaic_opera(DS, merge_args={}):
         colormap = None
     return merged_arr, colormap, nodata
 
+def opera_rules(product="OPERA_L3_DSWX-S1_V1", nodata=255):
+    """Returns a custom callabale rasterio.merge method for OPERA products using pixel priority rules.
+    Args:
+        product (str): OPERA product short name, used to determine pixel prioritization in regions of OPERA granule overlap.
+            Options include: "OPERA_L3_DSWX-HLS_V1","OPERA_L3_DSWX-S1_V1", "OPERA_L3_DIST-ALERT-HLS_V1", "OPERA_L3_DIST-ANN-HLS_V1", "OPERA_L2_RTC-S1_V1" 
+            Default: "OPERA_L3_DSWX-S1_V1"
+        nodata (int): The nodata value for the OPERA product. Default is 255.
+    Returns:
+        method (function): A function that implements the custom merge method for the specified OPERA product.
+    """
+
+    if product in ("OPERA_L3_DSWX-HLS_V1", "OPERA_L3_DSWX-S1_V1"):
+        priority = {
+            1: 100,   # Open water (DSWx-HLS, DSWx-S1)
+            2: 95,    # Partial surface water (DSWx-HLS)
+            3: 90,    # Inundated vegetation (DSWx-S1)
+            0: 50,    # Not water (DSWx-HLS, DSWx-S1)
+            250: 20,  # Height Above Nearest Drainage (HAND) masked (DSWx-S1)
+            251: 15,  # Layover/shadow masked (DSWx-S1)
+            252: 10,  # Snow/Ice (DSWx-HLS)
+            253: 5,   # Cloud/Cloud shadow (DSWx-HLS)
+            254: 1,   # Ocean masked (DSWx-HLS)
+            255: 0    # Fill value (no data) (DSWx-HLS, DSWx-S1)
+        }
+    elif product in ("OPERA_L3_DIST-ALERT-HLS_V1", "OPERA_L3_DIST-ANN-HLS_V1"):
+        priority = {
+            1:100, # first <50% 
+            2:100, # provisional <50% 
+            3:100, # confirmed <50% 
+            4:100, # first ≥50% 
+            5:100, # provisional ≥50% 
+            6:100, # confirmed ≥50% 
+            7:100, # confirmed <50%, finished 
+            8:100, # confirmed ≥50%, finished 
+            9:100, # confirmed previous year <50% 
+            10:100, # confirmed previous year ≥50%
+            0:10, # No disturbance 
+            255:0 # No data
+        }
+    elif product == 'OPERA_L2_RTC-S1_V1':
+        priority = {
+            1: 100,   # Open water (DSWx-HLS, DSWx-S1)
+            2: 95,    # Partial surface water (DSWx-HLS)
+            3: 90,    # Inundated vegetation (DSWx-S1)
+            0: 50,    # Not water (DSWx-HLS, DSWx-S1)
+            250: 20,  # Height Above Nearest Drainage (HAND) masked (DSWx-S1)
+            251: 15,  # Layover/shadow masked (DSWx-S1)
+            252: 10,  # Snow/Ice (DSWx-HLS)
+            253: 5,   # Cloud/Cloud shadow (DSWx-HLS)
+            254: 1,   # Ocean masked (DSWx-HLS)
+            255: 0    # Fill value (no data) (DSWx-HLS, DSWx-S1)
+        }
+
+    else:
+        raise ValueError(f"Unknown product type: {product}. Supported products are DSWx, DIST, RTC.")
+
+    def method(old_data, new_data, old_nodata=None, new_nodata=None, index=None, roff=None, coff=None):
+        """
+        Custom merge method for OPERA products using pixel priority rules.
+
+        Args:
+            old_data (numpy.ndarray): The existing data array.
+            new_data (numpy.ndarray): The new data array to merge.
+            old_nodata (int, optional): The nodata value for the existing data. Defaults to None. Required by rasterio.merge.
+            new_nodata (int, optional): The nodata value for the new data. Defaults to None. Required by rasterio.merge.
+            index (tuple, optional): The index of the pixel being merged. Defaults to None. Required by rasterio.merge.
+            roff (int, optional): Row offset. Defaults to None. Required by rasterio.merge.
+            coff (int, optional): Column offset. Defaults to None. Required by rasterio.merge.
+        
+        Returns:
+            numpy.ndarray: The merged data array.
+        """
+        import numpy as np
+
+        # Create priority lookup table as a NumPy array for fast indexing
+        max_val = max(priority.keys()) + 1
+        priority_array = np.full(max_val, -1, dtype=np.int16)
+        for val, pri in priority.items():
+            priority_array[val] = pri
+
+        # Only apply to valid new data (exclude nodata)
+        valid_mask = new_data != nodata
+
+        for i in range(old_data.shape[0]):
+            new_vals = new_data[i]
+            old_vals = old_data[i]
+
+            # Only evaluate valid positions
+            new_priorities = priority_array[new_vals]
+            old_priorities = priority_array[old_vals]
+
+            update_mask = (valid_mask[i]) & (new_priorities > old_priorities)
+
+            # Apply the update
+            old_vals[update_mask] = new_vals[update_mask]
+
+        return old_data
+    return method
+
+def contains_unexpected_values(DA, valid_values):
+    import numpy as np
+    for da in DA:
+        unique_vals = np.unique(da.values)
+        if not set(unique_vals).issubset(valid_values):
+            return True
+    return False
 
 def geometry_bounds(geometry, decimals=4):
     """Returns the bounds of a geometry.

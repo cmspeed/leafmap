@@ -6648,6 +6648,7 @@ def nasa_opera_gui(
     from pathlib import Path
     from opera_utils.disp._remote import open_file
     import netrc
+    from collections import Counter
 
     widget_width = "600px"
     padding = "0px 0px 0px 5px"  # upper, right, bottom, left
@@ -6925,7 +6926,7 @@ def nasa_opera_gui(
                             short_name=short_name.value,
                             bbox=bounds,
                             temporal=date_range,
-                            return_gdf=True,
+                            return_gdf=True
                         )
 
                         if len(results) > 0:
@@ -6994,7 +6995,7 @@ def nasa_opera_gui(
                                 layer.value = None
 
                             output.clear_output()
-
+                            
                             print(
                                 'Option 1: Select granule from the Dataset menu and click "Display (Single)"'
                             )
@@ -7026,7 +7027,7 @@ def nasa_opera_gui(
                             f = open_file(
                                 link,
                                 earthdata_username=username,
-                                earthdata_password=password,
+                                earthdata_password=password
                             )
                             ds = rioxarray.open_rasterio(f, masked=False)
                         setattr(m, "_NASA_DATA_DS", ds)
@@ -7036,6 +7037,8 @@ def nasa_opera_gui(
                             colormap = get_image_colormap(ds)
                         except Exception as e:
                             colormap = None
+                        if short_name.value == "OPERA_L2_RTC-S1_V1":
+                            da = np.clip(10*np.log10(da), -27, 0)
                         image = array_to_image(da, colormap=colormap)
                         setattr(m, "_NASA_DATA_IMAGE", image)
                         name_prefix = layer.value.split(".")[0]
@@ -7117,7 +7120,17 @@ def nasa_opera_gui(
                                     earthdata_password=password,
                                 )
                                 DS.append(rioxarray.open_rasterio(f, masked=False))
-                        da_mosaic, colormap, nodata = mosaic_opera(DS, merge_args={})
+
+                                # Sort DS by most common crs for merging
+                                crs_list = [str(ds.rio.crs) for ds in DS]
+                                crs_counter = Counter(crs_list)
+                                most_common_crs_str, _ = crs_counter.most_common(1)[0]
+                                DS.sort(key=lambda ds: 0 if str(ds.rio.crs) == most_common_crs_str else 1)
+
+                        # Perform merge using OPERA product pixel priority rules
+                        da_mosaic, colormap, nodata = mosaic_opera(DS, product=short_name.value, merge_args={})
+                        if short_name.value == "OPERA_L2_RTC-S1_V1":
+                            da_mosaic = np.clip(10*np.log10(da_mosaic), -27, 0)
                         setattr(m, "_NASA_DATA_DS", da_mosaic)
                         image = array_to_image(da_mosaic, colormap=colormap)
                         setattr(m, "_NASA_DATA_IMAGE", image)
@@ -7139,6 +7152,52 @@ def nasa_opera_gui(
                 except Exception as e:
                     output.clear_output()
                     print(e)
+
+        elif change["new"] == "Display (Mosaic)":
+            output.clear_output()
+            with output:
+                print("Loading granule mosaic...")
+                layer_links = [result.data_links()[layer.index] for result in m._NASA_DATA_RESULTS]
+                tif_links = [link for link in layer_links if link.endswith(".tif")]
+                if tif_links:
+                    links = tif_links
+                else:
+                    links = [link for link in layer_links if link.endswith(".h5")]
+                try:
+                    if links[0].endswith(".tif"):
+                        DS = []
+                        for link in links:
+                            try:
+                                DS.append(rioxarray.open_rasterio(link, masked=False))
+                            except Exception as e:
+                                f = open_file(
+                                    link,
+                                    earthdata_username=username,
+                                    earthdata_password=password
+                                )
+                                DS.append(rioxarray.open_rasterio(f, masked=False))
+                        da_mosaic, colormap, nodata = mosaic_opera(DS, product=dataset.value, merge_args={})
+                        setattr(m, "_NASA_DATA_DS", da_mosaic)
+                        image = array_to_image(da_mosaic, colormap=colormap)
+                        setattr(m, "_NASA_DATA_IMAGE", image)
+                        name_prefix = layer.value.split(".")[0]
+                        items = dataset.value.split("_")
+                        name_suffix = items[3] + "_" + items[4][:8] + "_" + items[6]
+                        layer_name = f"{name_prefix}_{name_suffix}"
+                        m.add_raster(
+                            image,
+                            zoom_to_layer=True,
+                            colormap=palette.value,
+                            nodata=nodata,
+                            layer_name=layer_name,
+                        )
+                        output.clear_output()
+                    else:
+                        output.clear_output()
+                        print("Currently only geotiff mosaicking is supported.")
+                except Exception as e:
+                    output.clear_output()
+                    print(e)            
 
         elif change["new"] == "Reset":
             short_name.options = m._NASA_DATA_NAMES
